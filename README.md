@@ -131,7 +131,6 @@ print(health, stats)
    - Health checks allow you to monitor provider availability.
 
 6. **Integration:**
-   - Ideal for NFT forensic analysis, wallet tracking, and token audits.
    - Can be integrated with other Solana analytics pipelines.
 
 ---
