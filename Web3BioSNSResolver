@@ -1,0 +1,486 @@
+import asyncio
+import aiohttp
+import time
+import hashlib
+import logging
+from typing import Dict, Any, List, Optional
+from urllib.parse import quote
+
+try:
+    import aiosqlite
+    SQLITE_AVAILABLE = True
+except ImportError:
+    SQLITE_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+
+class RateLimiter:
+    """Optimized token-bucket limiter with burst capacity."""
+    def __init__(self, rate: float = 2.0, per: float = 1.0, burst: float = 5.0):
+        self.rate = rate
+        self.per = per
+        self.burst = burst
+        self.tokens = burst
+        self.last_refill = time.monotonic()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self.lock:
+            now = time.monotonic()
+            elapsed = now - self.last_refill
+            self.last_refill = now
+            
+            # Refill tokens
+            self.tokens = min(self.burst, self.tokens + elapsed * (self.rate / self.per))
+            
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return
+                
+            # Wait for token
+            wait_time = (1.0 - self.tokens) * (self.per / self.rate)
+            await asyncio.sleep(wait_time)
+            self.tokens = 0
+
+class Web3BioSNSResolver:
+    """
+    Optimized SNS resolver using Web3.bio - currently the most reliable provider.
+    Supports batch operations, intelligent caching, and robust error handling.
+    """
+    
+    BASE_URL = "https://api.web3.bio"
+    
+    def __init__(
+        self, 
+        cache_db: str = "web3bio_sns_cache.db", 
+        cache_ttl: int = 3600,
+        rate_limit: float = 2.0,  # requests per second
+        timeout: int = 10
+    ):
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.cache_db = cache_db
+        self.cache_ttl = cache_ttl
+        self.timeout = timeout
+        self.limiter = RateLimiter(rate=rate_limit, per=1.0, burst=rate_limit * 2)
+        self.max_retries = 3
+
+    async def __aenter__(self):
+        connector = aiohttp.TCPConnector(
+            limit=50,
+            limit_per_host=10,
+            keepalive_timeout=30
+        )
+        timeout = aiohttp.ClientTimeout(
+            total=self.timeout,
+            connect=5
+        )
+        headers = {
+            'User-Agent': 'SNSResolver/1.0',
+            'Accept': 'application/json'
+        }
+        
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers=headers
+        )
+        
+        if SQLITE_AVAILABLE:
+            await self._init_cache()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.session:
+            await self.session.close()
+
+    async def _init_cache(self):
+        """Initialize cache with better schema and cleanup."""
+        async with aiosqlite.connect(self.cache_db) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS sns_cache (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expiry INTEGER NOT NULL
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_expiry ON sns_cache(expiry)")
+            await db.commit()
+            
+            # Clean expired entries
+            now = int(time.time())
+            result = await db.execute("DELETE FROM sns_cache WHERE expiry < ?", (now,))
+            await db.commit()
+            
+            if result.rowcount > 0:
+                logger.debug(f"Cleaned {result.rowcount} expired cache entries")
+
+    def _cache_key(self, prefix: str, identifier: str) -> str:
+        """Generate cache key with better collision resistance."""
+        identifier = identifier.strip().lower()
+        if len(identifier) > 150:
+            # Use SHA-256 for very long identifiers
+            identifier = hashlib.sha256(identifier.encode()).hexdigest()
+        return f"web3bio:{prefix}:{identifier}"
+
+    async def _cache_get(self, key: str) -> Optional[str]:
+        """Get from cache with error handling."""
+        if not SQLITE_AVAILABLE:
+            return None
+            
+        try:
+            async with aiosqlite.connect(self.cache_db) as db:
+                now = int(time.time())
+                async with db.execute(
+                    "SELECT value FROM sns_cache WHERE key = ? AND expiry > ?", 
+                    (key, now)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    return row[0] if row else None
+        except Exception as e:
+            logger.debug(f"Cache get error for {key}: {e}")
+            return None
+
+    async def _cache_set(self, key: str, value: str):
+        """Set cache with metadata."""
+        if not SQLITE_AVAILABLE:
+            return
+            
+        try:
+            now = int(time.time())
+            expiry = now + self.cache_ttl
+            async with aiosqlite.connect(self.cache_db) as db:
+                await db.execute(
+                    "REPLACE INTO sns_cache (key, value, created_at, expiry) VALUES (?, ?, ?, ?)",
+                    (key, value, now, expiry)
+                )
+                await db.commit()
+        except Exception as e:
+            logger.debug(f"Cache set error for {key}: {e}")
+
+    async def _request_with_retry(self, url: str) -> Optional[Dict[str, Any]]:
+        """Make HTTP request with exponential backoff retry."""
+        await self.limiter.acquire()
+        
+        last_exception = None
+        for attempt in range(self.max_retries):
+            try:
+                async with self.session.get(url) as resp:
+                    if resp.status == 200:
+                        try:
+                            return await resp.json()
+                        except Exception as e:
+                            logger.warning(f"JSON decode error: {e}")
+                            return None
+                    elif resp.status == 404:
+                        # Valid response, just not found
+                        return None
+                    elif resp.status == 429:
+                        # Rate limited - wait longer
+                        wait_time = min(2 ** attempt * 2, 30)
+                        logger.debug(f"Rate limited, waiting {wait_time}s")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        text = await resp.text()
+                        raise aiohttp.ClientResponseError(
+                            request_info=resp.request_info,
+                            history=resp.history,
+                            status=resp.status,
+                            message=f"HTTP {resp.status}: {text[:200]}"
+                        )
+                        
+            except asyncio.TimeoutError as e:
+                last_exception = e
+                logger.debug(f"Timeout on attempt {attempt + 1}")
+            except Exception as e:
+                last_exception = e
+                logger.debug(f"Request attempt {attempt + 1} failed: {e}")
+                
+            if attempt < self.max_retries - 1:
+                # Exponential backoff with jitter
+                delay = min(2 ** attempt * 0.5, 10) + (time.time() % 1) * 0.1
+                await asyncio.sleep(delay)
+        
+        logger.warning(f"All retries failed for {url}: {last_exception}")
+        return None
+
+    async def resolve_name(self, name: str) -> Optional[str]:
+        """
+        Forward lookup: .sol domain -> wallet address
+        
+        Args:
+            name: Domain name (with or without .sol suffix)
+            
+        Returns:
+            Wallet address or None if not found
+        """
+        if not name or not name.strip():
+            return None
+            
+        name = name.strip().lower()
+        if not name.endswith('.sol'):
+            name += '.sol'
+            
+        cache_key = self._cache_key("name", name)
+        cached = await self._cache_get(cache_key)
+        if cached:
+            logger.debug(f"Cache hit for {name}")
+            return cached
+
+        # Web3.bio expects domain without .sol for the ns endpoint
+        domain_for_api = name[:-4]  # Remove .sol suffix
+        url = f"{self.BASE_URL}/ns/solana/{quote(domain_for_api)}"
+        
+        data = await self._request_with_retry(url)
+        if data and "owner" in data and data["owner"]:
+            owner = data["owner"]
+            await self._cache_set(cache_key, owner)
+            logger.debug(f"Resolved {name} -> {owner}")
+            return owner
+            
+        logger.debug(f"Could not resolve {name}")
+        return None
+
+    async def reverse_lookup(self, wallet: str) -> Optional[str]:
+        """
+        Reverse lookup: wallet address -> .sol domain
+        
+        Args:
+            wallet: Solana wallet address
+            
+        Returns:
+            Domain name (with .sol suffix) or None if not found
+        """
+        if not wallet or not wallet.strip():
+            return None
+            
+        wallet = wallet.strip()
+        cache_key = self._cache_key("addr", wallet)
+        cached = await self._cache_get(cache_key)
+        if cached:
+            logger.debug(f"Cache hit for {wallet}")
+            return cached
+
+        url = f"{self.BASE_URL}/profile/solana/{quote(wallet)}"
+        data = await self._request_with_retry(url)
+        
+        if data:
+            # Check multiple possible response structures
+            domain = None
+            
+            # Try different response formats Web3.bio might use
+            if "sns" in data and isinstance(data["sns"], dict):
+                domain = data["sns"].get("domain") or data["sns"].get("name")
+            elif "domain" in data:
+                domain = data["domain"]
+            elif "displayName" in data and data["displayName"].endswith(".sol"):
+                domain = data["displayName"]
+                
+            if domain:
+                if not domain.endswith(".sol"):
+                    domain += ".sol"
+                await self._cache_set(cache_key, domain)
+                logger.debug(f"Reverse resolved {wallet} -> {domain}")
+                return domain
+                
+        logger.debug(f"Could not reverse resolve {wallet}")
+        return None
+
+    async def batch_resolve_names(
+        self, 
+        names: List[str], 
+        batch_size: int = 25,
+        concurrency: int = 3
+    ) -> Dict[str, Optional[str]]:
+        """
+        Batch forward lookup with optimal batching.
+        
+        Args:
+            names: List of domain names
+            batch_size: How many to resolve per API call
+            concurrency: How many concurrent batches
+            
+        Returns:
+            Dict mapping domain names to wallet addresses
+        """
+        if not names:
+            return {}
+            
+        # Normalize names and check cache first
+        normalized_names = []
+        results = {}
+        
+        for name in names:
+            if not name or not name.strip():
+                results[name] = None
+                continue
+                
+            normalized = name.strip().lower()
+            if not normalized.endswith('.sol'):
+                normalized += '.sol'
+            normalized_names.append(normalized)
+            
+            # Check cache
+            cache_key = self._cache_key("name", normalized)
+            cached = await self._cache_get(cache_key)
+            if cached:
+                results[name] = cached
+            else:
+                results[name] = None  # Placeholder for batch processing
+        
+        # Find names that need API calls
+        uncached_names = [name for name in normalized_names if results.get(name) is None]
+        if not uncached_names:
+            return results
+            
+        # Process in batches with concurrency control
+        semaphore = asyncio.Semaphore(concurrency)
+        
+        async def process_batch(batch: List[str]):
+            async with semaphore:
+                # Remove .sol suffix for API
+                domains_for_api = [name[:-4] for name in batch]
+                ids_param = ",".join(quote(domain) for domain in domains_for_api)
+                url = f"{self.BASE_URL}/ns/batch/{ids_param}"
+                
+                data = await self._request_with_retry(url)
+                if data:
+                    for i, original_name in enumerate(batch):
+                        domain_key = domains_for_api[i]
+                        entry = data.get(domain_key, {})
+                        owner = entry.get("owner")
+                        
+                        if owner:
+                            results[original_name] = owner
+                            cache_key = self._cache_key("name", original_name)
+                            await self._cache_set(cache_key, owner)
+                        else:
+                            results[original_name] = None
+        
+        # Create batches and process them
+        batches = [
+            uncached_names[i:i + batch_size] 
+            for i in range(0, len(uncached_names), batch_size)
+        ]
+        
+        await asyncio.gather(*[process_batch(batch) for batch in batches])
+        return results
+
+    async def batch_reverse_lookup(
+        self, 
+        wallets: List[str], 
+        concurrency: int = 5
+    ) -> Dict[str, Optional[str]]:
+        """
+        Batch reverse lookup (no batch API available, so concurrent single calls).
+        
+        Args:
+            wallets: List of wallet addresses
+            concurrency: Max concurrent requests
+            
+        Returns:
+            Dict mapping wallet addresses to domain names
+        """
+        if not wallets:
+            return {}
+            
+        semaphore = asyncio.Semaphore(concurrency)
+        results = {}
+        
+        async def worker(wallet: str):
+            async with semaphore:
+                try:
+                    results[wallet] = await self.reverse_lookup(wallet)
+                except Exception as e:
+                    logger.error(f"Failed to reverse lookup {wallet}: {e}")
+                    results[wallet] = None
+        
+        await asyncio.gather(*[worker(wallet) for wallet in wallets])
+        return results
+
+    async def health_check(self) -> bool:
+        """Check if Web3.bio API is responding."""
+        try:
+            # Test with a known working domain
+            result = await self.resolve_name("bonfida.sol")
+            return result is not None
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            return False
+
+    async def get_cache_stats(self) -> Dict[str, int]:
+        """Get cache statistics."""
+        if not SQLITE_AVAILABLE:
+            return {"error": "SQLite not available"}
+            
+        try:
+            async with aiosqlite.connect(self.cache_db) as db:
+                now = int(time.time())
+                
+                # Total entries
+                async with db.execute("SELECT COUNT(*) FROM sns_cache") as cursor:
+                    total = (await cursor.fetchone())[0]
+                
+                # Valid entries
+                async with db.execute("SELECT COUNT(*) FROM sns_cache WHERE expiry > ?", (now,)) as cursor:
+                    valid = (await cursor.fetchone())[0]
+                
+                # Expired entries
+                expired = total - valid
+                
+                return {
+                    "total_entries": total,
+                    "valid_entries": valid, 
+                    "expired_entries": expired,
+                    "cache_ttl": self.cache_ttl
+                }
+        except Exception as e:
+            logger.error(f"Cache stats error: {e}")
+            return {"error": str(e)}
+
+
+# Example usage
+async def main():
+    """Example usage of the Web3.bio SNS resolver."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    async with Web3BioSNSResolver(rate_limit=2.0, cache_ttl=7200) as resolver:
+        print("🔍 Testing Web3.bio SNS Resolver")
+        
+        # Health check
+        health = await resolver.health_check()
+        print(f"✅ API Health: {'OK' if health else 'FAILED'}")
+        
+        if not health:
+            print("❌ Web3.bio API appears to be down")
+            return
+        
+        # Single resolution
+        print("\n📍 Single Resolution:")
+        wallet = await resolver.resolve_name("bonfida.sol")
+        print(f"bonfida.sol -> {wallet}")
+        
+        # Reverse lookup
+        if wallet:
+            domain = await resolver.reverse_lookup(wallet)
+            print(f"{wallet} -> {domain}")
+        
+        # Batch operations
+        print("\n📦 Batch Resolution:")
+        test_domains = ["bonfida.sol", "dex.sol", "solana.sol", "nonexistent.sol"]
+        batch_results = await resolver.batch_resolve_names(test_domains)
+        
+        for domain, address in batch_results.items():
+            status = "✅" if address else "❌"
+            print(f"{status} {domain} -> {address}")
+        
+        # Cache stats
+        stats = await resolver.get_cache_stats()
+        print(f"\n💾 Cache Stats: {stats}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
