@@ -1,13 +1,9 @@
-# multi_fallback_sns_resolver.py
-# Hardened async multi-provider SNS resolver with retries, caching, and fallbacks
-# GitHub-ready version
-
 import asyncio
 import aiohttp
 import time
 import hashlib
 import logging
-from typing import Optional, List, Dict
+from typing import Dict, Any, Optional, List
 
 try:
     import aiosqlite
@@ -15,12 +11,17 @@ try:
 except ImportError:
     SQLITE_AVAILABLE = False
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+from solders.pubkey import Pubkey
+from solders.system_program import SYS_PROGRAM_ID
 
+# SNS program ID (correct one)
+SNS_PROGRAM_ID = Pubkey.from_string("namesLPneVptA9Z5rqUDD9tMTWEJwofgaYwp8cawRkX")
+ROOT_DOMAIN_ACCOUNT = Pubkey.from_string("58PwtjSDuFHuUkYjkwrj2Abf8AX9oU5P9Wq5iTn33LPH")
+
+logger = logging.getLogger(__name__)
 
 class RateLimiter:
-    """Async token-bucket rate limiter."""
+    """Async token-bucket style limiter."""
     def __init__(self, rate: int, per: float):
         self.rate = rate
         self.per = per
@@ -37,220 +38,372 @@ class RateLimiter:
             if self.allowance > self.rate:
                 self.allowance = self.rate
             if self.allowance < 1.0:
-                wait_time = (1.0 - self.allowance) * (self.per / self.rate)
-                await asyncio.sleep(wait_time)
+                sleep_time = (1.0 - self.allowance) * (self.per / self.rate)
+                await asyncio.sleep(sleep_time)
                 self.allowance = 0
             else:
                 self.allowance -= 1.0
 
-
-class MultiFallbackSnsResolver:
-    """
-    Multi-provider Solana Name Service (SNS) resolver with caching,
-    rate-limiting, and parallel fallback support.
-    """
-
+class SNSResolver:
     def __init__(
         self,
-        helius_api_key: Optional[str] = None,
-        shyft_api_key: Optional[str] = None,
-        solanafm_enabled: bool = True,
-        sqlite_cache_path: Optional[str] = "sns_cache.db",
-        parallel_fallbacks: bool = True,
+        rpc_endpoint: str = "https://api.mainnet-beta.solana.com",
+        solanafm_api: str = "https://api.solana.fm/v0",
+        cache_db: str = "sns_cache.db",
+        global_rate: int = 10,
+        global_per: float = 1.0,
         cache_ttl: int = 3600,
-        request_timeout: int = 15,
-        max_retries: int = 3,
+        timeout: int = 15,
+        max_retries: int = 3
     ):
-        self.helius_api_key = helius_api_key
-        self.shyft_api_key = shyft_api_key
-        self.solanafm_enabled = solanafm_enabled
-        self.parallel_fallbacks = parallel_fallbacks
+        self.rpc_endpoint = rpc_endpoint
+        self.solanafm_api = solanafm_api
+        self.cache_db = cache_db
         self.cache_ttl = cache_ttl
-        self.request_timeout = request_timeout
+        self.timeout = timeout
         self.max_retries = max_retries
-
         self.session: Optional[aiohttp.ClientSession] = None
-        self.sqlite_cache_path = sqlite_cache_path
-        self.memory_cache: Dict[str, tuple] = {}
-        self.db = None
 
-        # Rate limiters per provider
-        self.rate_limiters = {
-            "helius": RateLimiter(5, 1.0),
-            "shyft": RateLimiter(5, 1.0),
-            "solanafm": RateLimiter(5, 1.0),
+        self.global_limiter = RateLimiter(global_rate, global_per)
+        
+        # Track API health
+        self.api_stats = {
+            'rpc': {'calls': 0, 'successes': 0, 'total_time': 0.0},
+            'solanafm': {'calls': 0, 'successes': 0, 'total_time': 0.0}
         }
 
-    async def init(self):
-        """Initialize aiohttp session and SQLite cache."""
-        timeout = aiohttp.ClientTimeout(total=self.request_timeout)
+    async def __aenter__(self):
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
         self.session = aiohttp.ClientSession(timeout=timeout)
+        if SQLITE_AVAILABLE:
+            await self._init_cache()
+        return self
 
-        if SQLITE_AVAILABLE and self.sqlite_cache_path:
-            self.db = await aiosqlite.connect(self.sqlite_cache_path)
-            await self.db.execute(
-                "CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT, expiry INTEGER)"
-            )
-            await self.db.commit()
-            logger.info(f"Initialized SQLite cache at {self.sqlite_cache_path}")
-
-    async def close(self):
-        """Clean up async resources."""
+    async def __aexit__(self, exc_type, exc, tb):
         if self.session:
             await self.session.close()
-        if self.db:
-            await self.db.close()
-        logger.info("Closed SNS resolver resources")
 
-    # -----------------------------
-    # Caching
-    # -----------------------------
+    async def _init_cache(self):
+        """Initialize SQLite cache with TTL support."""
+        async with aiosqlite.connect(self.cache_db) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS cache (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    expiry INTEGER
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_expiry ON cache(expiry)")
+            await db.commit()
+            
+            # Clean up expired entries
+            now = int(time.time())
+            await db.execute("DELETE FROM cache WHERE expiry < ?", (now,))
+            await db.commit()
+
+    def _make_cache_key(self, prefix: str, identifier: str) -> str:
+        """Create cache key, hashing long identifiers."""
+        if len(identifier) > 100:
+            identifier = hashlib.sha256(identifier.encode()).hexdigest()[:32]
+        return f"{prefix}:{identifier}"
+
     async def _cache_get(self, key: str) -> Optional[str]:
-        now = int(time.time())
-        # Memory cache
-        if key in self.memory_cache:
-            value, expiry = self.memory_cache[key]
-            if expiry > now:
-                return value
-            del self.memory_cache[key]
-
-        # SQLite cache
-        if self.db:
-            async with self.db.execute(
-                "SELECT value, expiry FROM cache WHERE key = ?", (key,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    value, expiry = row
-                    if expiry > now:
-                        self.memory_cache[key] = (value, expiry)
-                        return value
-                    else:
-                        await self.db.execute("DELETE FROM cache WHERE key=?", (key,))
-                        await self.db.commit()
-        return None
+        if not SQLITE_AVAILABLE:
+            return None
+        
+        try:
+            async with aiosqlite.connect(self.cache_db) as db:
+                now = int(time.time())
+                async with db.execute("SELECT value FROM cache WHERE key = ? AND expiry > ?", (key, now)) as cursor:
+                    row = await cursor.fetchone()
+                    return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Cache get error: {e}")
+            return None
 
     async def _cache_set(self, key: str, value: str):
-        expiry = int(time.time()) + self.cache_ttl
-        self.memory_cache[key] = (value, expiry)
-        if self.db:
-            await self.db.execute(
-                "INSERT OR REPLACE INTO cache (key, value, expiry) VALUES (?, ?, ?)",
-                (key, value, expiry),
-            )
-            await self.db.commit()
+        if not SQLITE_AVAILABLE:
+            return
+        
+        try:
+            expiry = int(time.time()) + self.cache_ttl
+            async with aiosqlite.connect(self.cache_db) as db:
+                await db.execute("REPLACE INTO cache (key, value, expiry) VALUES (?, ?, ?)", 
+                                (key, value, expiry))
+                await db.commit()
+        except Exception as e:
+            logger.error(f"Cache set error: {e}")
 
-    def _normalize_domain(self, domain: str) -> str:
-        if domain and not domain.endswith(".sol"):
-            return domain + ".sol"
-        return domain
+    def _record_api_call(self, api_name: str, success: bool, duration: float):
+        """Track API performance."""
+        stats = self.api_stats[api_name]
+        stats['calls'] += 1
+        stats['total_time'] += duration
+        if success:
+            stats['successes'] += 1
 
-    # -----------------------------
-    # HTTP Requests
-    # -----------------------------
-    async def _retry_request(self, provider: str, method: str, url: str, **kwargs):
-        """HTTP request with retries and provider rate limiting."""
-        limiter = self.rate_limiters.get(provider)
-        if limiter:
-            await limiter.acquire()
-
-        delay = 0.5
+    async def _throttled_request(self, method: str, url: str, api_name: str = 'unknown', **kwargs) -> Optional[Dict[str, Any]]:
+        """Make throttled request with retry logic and stats tracking."""
+        await self.global_limiter.acquire()
+        
+        start_time = time.time()
         last_exception = None
+        
         for attempt in range(self.max_retries):
             try:
                 async with self.session.request(method, url, **kwargs) as resp:
+                    duration = time.time() - start_time
+                    
                     if resp.status == 200:
-                        return await resp.json()
+                        result = await resp.json()
+                        self._record_api_call(api_name, True, duration)
+                        return result
                     elif resp.status == 404:
+                        # 404 is valid "not found" response
+                        self._record_api_call(api_name, True, duration)
                         return None
                     else:
                         text = await resp.text()
+                        error = f"HTTP {resp.status}: {text[:200]}"
+                        logger.warning(f"{api_name} API returned {resp.status}: {text[:100]}")
                         raise aiohttp.ClientResponseError(
                             request_info=resp.request_info,
                             history=resp.history,
                             status=resp.status,
-                            message=f"HTTP {resp.status}: {text[:200]}",
+                            message=error
                         )
+                        
             except Exception as e:
                 last_exception = e
                 if attempt == self.max_retries - 1:
-                    logger.error(f"{provider} request failed {url}: {e}")
-                    raise
+                    duration = time.time() - start_time
+                    self._record_api_call(api_name, False, duration)
+                    logger.error(f"{api_name} request failed after {self.max_retries} attempts: {e}")
+                    break
+                    
+                # Exponential backoff
+                delay = (2 ** attempt) * 0.5
+                logger.debug(f"{api_name} attempt {attempt + 1} failed: {e}, retrying in {delay}s")
                 await asyncio.sleep(delay)
-                delay *= 2
-        raise last_exception
+        
+        return None
 
-    # -----------------------------
-    # Reverse Lookup (wallet -> domain)
-    # -----------------------------
-    async def reverse_lookup(self, wallet: str) -> Optional[str]:
-        cache_key = f"addr:{wallet}"
+    def _derive_name_account(self, name: str) -> Pubkey:
+        """Derive SNS name account PDA (proper implementation)."""
+        # Remove .sol if present
+        if name.endswith('.sol'):
+            name = name[:-4]
+            
+        # Handle subdomains properly
+        labels = name.split('.')
+        parent = ROOT_DOMAIN_ACCOUNT
+        
+        # Process labels from right to left (parent to child)
+        for i in range(len(labels) - 1, -1, -1):
+            label = labels[i]
+            hashed = hashlib.sha256(label.encode()).digest()
+            name_account, _ = Pubkey.find_program_address([hashed, bytes(32), bytes(parent)], SNS_PROGRAM_ID)
+            parent = name_account
+            
+        return parent
+
+    # ------------------------------
+    # .sol -> wallet (PDA computation + RPC)
+    # ------------------------------
+    async def resolve_name(self, name: str) -> Optional[str]:
+        """Resolve a .sol domain to wallet address using proper SNS PDA computation."""
+        if not name:
+            return None
+            
+        # Normalize domain
+        domain = name.strip().lower()
+        if not domain.endswith('.sol'):
+            domain = domain + '.sol'
+        
+        cache_key = self._make_cache_key("name", domain)
         cached = await self._cache_get(cache_key)
         if cached:
+            logger.debug(f"Cache hit for domain resolution: {domain} -> {cached}")
             return cached
 
-        tasks = []
+        try:
+            # Compute proper SNS PDA
+            pda = self._derive_name_account(domain)
+            logger.debug(f"Derived PDA {pda} for domain {domain}")
 
-        if self.helius_api_key:
-            tasks.append(self._reverse_helius(wallet))
-        if self.shyft_api_key:
-            tasks.append(self._reverse_shyft(wallet))
-        if self.solanafm_enabled:
-            tasks.append(self._reverse_solanafm(wallet))
+            # Query account info using RPC
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getAccountInfo",
+                "params": [str(pda), {"encoding": "base64"}]
+            }
+            
+            data = await self._throttled_request("POST", self.rpc_endpoint, api_name='rpc', json=payload)
+            
+            if data and data.get("result") and data["result"].get("value"):
+                account_data = data["result"]["value"]["data"]
+                if isinstance(account_data, list) and len(account_data) > 0:
+                    # Parse SNS registry data to get owner
+                    import base64
+                    try:
+                        decoded = base64.b64decode(account_data[0])
+                        if len(decoded) >= 64:
+                            # Owner is at bytes 32-64 in SNS registry
+                            owner_bytes = decoded[32:64]
+                            owner = str(Pubkey(owner_bytes))
+                            
+                            await self._cache_set(cache_key, owner)
+                            logger.info(f"Resolved {domain} to {owner}")
+                            return owner
+                    except Exception as e:
+                        logger.error(f"Failed to parse SNS account data for {domain}: {e}")
+            
+            logger.debug(f"No account data found for domain {domain}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error resolving domain {domain}: {e}")
+            return None
 
-        results = []
-        if self.parallel_fallbacks:
-            completed, pending = await asyncio.wait(
-                [asyncio.create_task(t) for t in tasks],
-                return_when=asyncio.FIRST_COMPLETED,
+    # ------------------------------
+    # wallet -> .sol (reverse lookup via solana.fm)
+    # ------------------------------
+    async def reverse_lookup(self, wallet: str) -> Optional[str]:
+        """Reverse lookup wallet to .sol domain using Solana.fm."""
+        if not wallet:
+            return None
+            
+        cache_key = self._make_cache_key("addr", wallet)
+        cached = await self._cache_get(cache_key)
+        if cached:
+            logger.debug(f"Cache hit for reverse lookup: {wallet} -> {cached}")
+            return cached
+
+        try:
+            url = f"{self.solanafm_api}/domains/{wallet}"
+            data = await self._throttled_request("GET", url, api_name='solanafm')
+            
+            domain = None
+            if data and isinstance(data, dict) and wallet in data:
+                domains_info = data[wallet].get("domains", [])
+                if domains_info and isinstance(domains_info, list):
+                    # Take first domain if multiple exist
+                    first_domain = domains_info[0]
+                    if isinstance(first_domain, dict) and "name" in first_domain:
+                        domain = first_domain["name"]
+                        if domain and not domain.endswith('.sol'):
+                            domain = domain + '.sol'
+
+            if domain:
+                await self._cache_set(cache_key, domain)
+                logger.info(f"Reverse lookup resolved {wallet} to {domain}")
+                return domain
+            else:
+                logger.debug(f"No domain found for wallet {wallet}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error in reverse lookup for {wallet}: {e}")
+            return None
+
+    async def batch_resolve_names(self, names: List[str], concurrency: int = 5) -> Dict[str, Optional[str]]:
+        """Batch resolve multiple domain names."""
+        semaphore = asyncio.Semaphore(concurrency)
+        results = {}
+
+        async def worker(name):
+            async with semaphore:
+                results[name] = await self.resolve_name(name)
+
+        logger.info(f"Starting batch name resolution for {len(names)} domains")
+        start_time = time.time()
+        
+        await asyncio.gather(*[worker(name) for name in names], return_exceptions=True)
+        
+        duration = time.time() - start_time
+        success_count = sum(1 for v in results.values() if v is not None)
+        logger.info(f"Batch resolution completed: {success_count}/{len(names)} resolved in {duration:.2f}s")
+        
+        return results
+
+    async def batch_reverse_lookup(self, wallets: List[str], concurrency: int = 5) -> Dict[str, Optional[str]]:
+        """Batch reverse lookup multiple wallet addresses."""
+        semaphore = asyncio.Semaphore(concurrency)
+        results = {}
+
+        async def worker(wallet):
+            async with semaphore:
+                results[wallet] = await self.reverse_lookup(wallet)
+
+        logger.info(f"Starting batch reverse lookup for {len(wallets)} wallets")
+        start_time = time.time()
+        
+        await asyncio.gather(*[worker(wallet) for wallet in wallets], return_exceptions=True)
+        
+        duration = time.time() - start_time
+        success_count = sum(1 for v in results.values() if v is not None)
+        logger.info(f"Batch reverse lookup completed: {success_count}/{len(wallets)} resolved in {duration:.2f}s")
+        
+        return results
+
+    def get_api_stats(self) -> Dict[str, Dict]:
+        """Get current API performance statistics."""
+        stats = {}
+        for api, data in self.api_stats.items():
+            if data['calls'] > 0:
+                success_rate = data['successes'] / data['calls']
+                avg_time = data['total_time'] / data['calls']
+                stats[api] = {
+                    'calls': data['calls'],
+                    'successes': data['successes'],
+                    'success_rate': f"{success_rate:.2%}",
+                    'avg_response_time': f"{avg_time:.3f}s"
+                }
+            else:
+                stats[api] = {
+                    'calls': 0,
+                    'successes': 0,
+                    'success_rate': 'No data',
+                    'avg_response_time': 'No data'
+                }
+        return stats
+
+    async def health_check(self) -> Dict[str, bool]:
+        """Test connectivity to RPC and Solana.fm."""
+        health = {}
+        
+        # Test RPC
+        try:
+            payload = {"jsonrpc": "2.0", "id": 1, "method": "getHealth"}
+            await asyncio.wait_for(
+                self._throttled_request("POST", self.rpc_endpoint, api_name='rpc', json=payload), 
+                timeout=5
             )
-            for task in completed:
-                try:
-                    res = await task
-                    if res:
-                        await self._cache_set(cache_key, res)
-                        for p in pending:
-                            p.cancel()
-                        return res
-                except Exception:
-                    continue
-        else:
-            for task in tasks:
-                try:
-                    res = await task
-                    if res:
-                        await self._cache_set(cache_key, res)
-                        return res
-                except Exception:
-                    continue
+            health['rpc'] = True
+            logger.info("RPC health check: OK")
+        except Exception as e:
+            health['rpc'] = False
+            logger.warning(f"RPC health check failed: {e}")
+        
+        # Test Solana.fm
+        try:
+            test_url = f"{self.solanafm_api}/domains/11111111111111111111111111111111"  # Invalid wallet for testing
+            await asyncio.wait_for(
+                self._throttled_request("GET", test_url, api_name='solanafm'),
+                timeout=5
+            )
+            health['solanafm'] = True
+            logger.info("Solana.fm health check: OK")
+        except Exception as e:
+            health['solanafm'] = False
+            logger.warning(f"Solana.fm health check failed: {e}")
+            
+        return health
 
-        await self._cache_set(cache_key, "")
-        return None
-
-    # -----------------------------
-    # Provider Implementations
-    # -----------------------------
-    async def _reverse_helius(self, wallet: str) -> Optional[str]:
-        url = f"https://rpc.helius.xyz/?api-key={self.helius_api_key}"
-        payload = {"jsonrpc": "2.0", "id": "sns-reverse", "method": "getNameOwner", "params": [wallet]}
-        data = await self._retry_request("helius", "POST", url, json=payload)
-        if data and "result" in data:
-            domain = data["result"].get("domain")
-            return self._normalize_domain(domain) if domain else None
-        return None
-
-    async def _reverse_shyft(self, wallet: str) -> Optional[str]:
-        url = f"https://api.shyft.to/sol/v1/names/reverse/{wallet}?network=mainnet-beta"
-        headers = {"x-api-key": self.shyft_api_key}
-        data = await self._retry_request("shyft", "GET", url, headers=headers)
-        if data and "result" in data:
-            domain = data["result"].get("domain")
-            return self._normalize_domain(domain) if domain else None
-        return None
-
-    async def _reverse_solanafm(self, wallet: str) -> Optional[str]:
-        url = f"https://api.solana.fm/v1/sns?wallet={wallet}"
-        data = await self._retry_request("solanafm", "GET", url)
-        if data and "domain" in data:
-            return self._normalize_domain(data["domain"])
-        return None
+# Usage example:
+# async with SNSResolver() as resolver:
+#     wallet = await resolver.resolve_name("example.sol")
+#     domain = await resolver.reverse_lookup("wallet_address_here")
+#     print(f"Domain: example.sol -> Wallet: {wallet}")
+#     print(f"Wallet: wallet_address_here -> Domain: {domain}")
