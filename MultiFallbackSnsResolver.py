@@ -113,7 +113,7 @@ class SNSResolver:
             return cached
 
         if self.helius_api_key:
-            url = f"https://mainnet.helius-rpc.com/?api-key={self.helius_api_key}"
+            url = f"https://rpc.helius.xyz"
             payload = {
                 "jsonrpc": "2.0",
                 "id": "sns-lookup",
@@ -147,7 +147,7 @@ class SNSResolver:
             return cached
 
         if self.helius_api_key:
-            url = f"https://mainnet.helius-rpc.com/?api-key={self.helius_api_key}"
+            url = f"https://rpc.helius.xyz"
             payload = {
                 "jsonrpc": "2.0",
                 "id": "sns-reverse",
