@@ -1,29 +1,47 @@
-I take almost zero credit for this as it is the result of strangling something I needed out of multiple AIs. I am art monkey not a code monkey. But I figured it might be useful to someone who doesn't want to have to wrap the node bonfida libraries even if it's a bit of a bodge solution. Unfortunately I can't offer troubleshooting but I can draw a picture of a duck look pensive if that helps.
+I take almost zero credit for this as it is the result of strangling something I needed out of multiple AIs. I am art monkey not a code monkey. But I figured it might be useful to someone who doesn't want to have to wrap the node bonfida libraries even if it's a bit of a bodge solution. Unfortunately I can't offer troubleshooting but I can draw a picture of a duck look pensive if that helps. 
 
-# Multi-Fallback SNS Resolver
+# Multi-Fallback Solana Name Service (SNS) Resolver
 
-A hardened, async Python resolver for Solana Name Service (SNS) domains. Supports multiple providers (Shyft, Helius, Bonfida), caching (memory + SQLite), rate-limiting, retries, and parallel fallbacks.
+A robust async Python resolver for Solana Name Service (SNS) domains and wallets.
+Supports **multiple providers** with caching, rate-limiting, retries, and optional parallel fallbacks.
+
+---
 
 ## Features
 
-* Resolve **SNS domain → wallet address**
-* Resolve **wallet address → SNS domain** (reverse lookup)
-* Automatic **fallback between multiple providers** based on success rate
-* **Parallel requests** for fastest resolution
-* **Memory + SQLite caching** with configurable TTL
-* **Retries with exponential backoff** for robust network handling
-* Optional **rate-limiting** per provider
-* Health checks and provider statistics
+* Reverse lookup: wallet → domain
+* Forward lookup: domain → wallet
+* Multiple providers: **Helius**, **Shyft**, **Solana.fm**
+* Async and parallel-safe
+* Configurable caching (memory + SQLite)
+* Provider-specific rate limiting
+* Retry with exponential backoff
 
-> **Important:** SNS domains (e.g., `example.sol`) **cannot** be passed directly to Solana RPC methods. They must first be resolved to a valid Solana public key (Base58) using this resolver.
+---
 
-## Installation
+## Requirements
+
+* Python 3.10+
+* [aiohttp](https://pypi.org/project/aiohttp/)
+* Optional: [aiosqlite](https://pypi.org/project/aiosqlite/) for persistent caching
 
 ```bash
 pip install aiohttp aiosqlite
 ```
 
-## Usage Example
+---
+
+## Installation
+
+Clone this repository or copy `multi_fallback_sns_resolver.py` into your project.
+
+```bash
+git clone https://github.com/yourusername/multi-fallback-sns-resolver.git
+```
+
+---
+
+## Usage
 
 ```python
 import asyncio
@@ -31,82 +49,88 @@ from multi_fallback_sns_resolver import MultiFallbackSnsResolver
 
 async def main():
     resolver = MultiFallbackSnsResolver(
-        rpc_url="https://api.mainnet-beta.solana.com",
-        shyft_api_key="YOUR_SHYFT_KEY",
-        helius_api_key="YOUR_HELIUS_KEY",
-        sqlite_cache_path="sns_cache.db"
+        helius_api_key="YOUR_HELIUS_API_KEY",
+        shyft_api_key="YOUR_SHYFT_API_KEY",
+        sqlite_cache_path="sns_cache.db",
+        parallel_fallbacks=True
     )
-    
+
     await resolver.init()
-    
-    # Resolve domain -> wallet
-    wallet = await resolver.reverse_lookup_with_fallbacks("example.sol")
-    print("Wallet for example.sol:", wallet)
-    
-    # Resolve wallet -> domain
-    domain = await resolver.get_wallet_domains_with_fallbacks(wallet)
-    print("Domains for wallet:", domain)
-    
+
+    # Reverse lookup: wallet -> domain
+    domain = await resolver.reverse_lookup("F4k3W4l1etAddr35545")
+    print("Resolved domain:", domain)
+
+    # Batch lookup example
+    wallets = ["Addr1...", "Addr2...", "Addr3..."]
+    results = await asyncio.gather(*[resolver.reverse_lookup(w) for w in wallets])
+    print(results)
+
     await resolver.close()
 
 asyncio.run(main())
 ```
 
-## Correct API Endpoints
+---
 
-**Shyft**
+## Providers & Endpoints
 
-* Reverse lookup (wallet → domain):
-  `GET https://api.shyft.to/sol/v1/names/reverse/{address}?network=mainnet-beta`
-* Forward lookup (domain → wallet):
-  `GET https://api.shyft.to/sol/v1/names/{domain}?network=mainnet-beta`
-* Header: `x-api-key: YOUR_SHYFT_KEY`
+| Provider  | Endpoint / Notes                                     | Requires API Key |
+| --------- | ---------------------------------------------------- | ---------------- |
+| Helius    | `https://rpc.helius.xyz/?api-key={key}`              | Yes              |
+| Shyft     | `https://api.shyft.to/sol/v1/names/reverse/{wallet}` | Yes              |
+| Solana.fm | `https://api.solana.fm/v1/sns?wallet={wallet}`       | No               |
 
-**Helius**
+> Forward lookup (domain → wallet) is supported via Helius and Shyft as well.
 
-* Reverse lookup (wallet → domain) using `getNameOwner`:
-  `POST https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY`
+---
 
-  ```json
-  {
-    "jsonrpc": "2.0",
-    "id": "sns-reverse",
-    "method": "getNameOwner",
-    "params": ["<wallet_address>"]
-  }
-  ```
-* Forward lookup (domain → wallet) using `getDomainKey`:
-  `POST https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY`
+## Features Details
 
-  ```json
-  {
-    "jsonrpc": "2.0",
-    "id": "sns-lookup",
-    "method": "getDomainKey",
-    "params": ["<sns_domain>"]
-  }
-  ```
+### Caching
 
-**Bonfida (public)**
+* **Memory cache** (fast, default)
+* **SQLite cache** (persistent) if `aiosqlite` is installed
+* Cache TTL configurable via `cache_ttl` (default: 3600s)
 
-* Reverse lookup (wallet → domain):
-  `GET https://sns-api.bonfida.com/reverse-lookup/{wallet_address}`
+### Rate Limiting
 
-## Batch Lookup Example
+* Token-bucket style limiter per provider
+* Default: 5 requests/sec per provider
+* Global limiter supported
 
-```python
-wallets = [
-    "Fv1nXf9E...abc",
-    "7Lh3vV8...xyz"
-]
+### Parallel Fallbacks
 
-results = await resolver.batch_reverse_lookup(wallets)
-for w, d in results.items():
-    print(w, "->", d)
+* If multiple providers are configured, resolver can **race them** and return the first successful result
+* Sequential fallback is also supported
+
+---
+
+## Error Handling
+
+* Retries with exponential backoff (configurable via `max_retries`)
+* Returns `None` if wallet or domain is not found
+* Logs detailed errors and warnings
+
+---
+
+## Example Logs
+
+```text
+INFO:root:Initialized SQLite cache at sns_cache.db
+INFO:root:Parallel lookup resolved F4k3W4l1etAddr35545 to "example.sol"
 ```
+
+---
+
+## License
+
+MIT License. Free to use, modify, and distribute.
+
+---
 
 ## Notes
 
-* Helius and Shyft POST requests require JSON-RPC payloads.
-* SNS domains **cannot** be used directly in Solana RPC calls; always resolve to wallet first.
-* Caching and rate-limiting help avoid hitting provider limits.
+1. **SNS domains cannot be used directly in Solana RPC calls** because they contain dots (`.`) which are not valid Base58 characters. Always resolve to wallet addresses first.
+2. API keys are required for Helius and Shyft. Solana.fm does not require a key.
+3. Designed for async applications; use `await` and `asyncio.run()` in your scripts.
